@@ -36,8 +36,9 @@ import threading
 import traceback
 import multiprocessing
 import os.path
+from collections import namedtuple
 
-from . import common, sim, endpoint as ep
+from da import common, sim, endpoint as ep
 
 api = common.api
 deprecated = common.deprecated
@@ -54,6 +55,27 @@ PerformanceCounters = {}
 CounterLock = threading.Lock()
 RootLock = threading.Lock()
 EndPointType = ep.UdpEndPoint
+
+class ProcessId(namedtuple('ProcessId', 'host, node, proc')):
+    @property
+    def address(self):
+        return (self.host, self.proc)
+    @property
+    def node_address(self):
+        return (self.host, self.node)
+
+    @classmethod
+    def _make(cls, host, node, proc):
+        if isinstance(node, str):
+            node = int(node)
+        if isinstance(proc, str):
+            proc = int(proc)
+        if not (isinstance(host, str) and isinstance(node, int) and
+                isinstance(proc, int) and
+                node > 1 and node < 65536 and
+                proc > 1 and proc < 65536):
+            raise ValueError('Got unexpected fields.')
+        return cls(host, node, proc)
 
 def find_file_on_paths(filename, paths):
     """Looks for a given 'filename' under a list of directories, in order.
@@ -208,15 +230,11 @@ def entrypoint():
         for i in range(0, niters):
             log.info("Running iteration %d ..." % (i+1))
 
-            walltime_start = time.perf_counter()
             module.main()
 
             print("Waiting for remaining child processes to terminate..."
                   "(Press \"Ctrl-C\" to force kill)")
 
-            walltime = time.perf_counter() - walltime_start
-
-            #log_performance_statistics(walltime)
             r = aggregate_statistics()
             for k, v in r.items():
                 stats[k] += v
@@ -386,38 +404,6 @@ def init_performance_counters(procs):
         CounterLock.acquire()
         PerformanceCounters[p] = dict()
         CounterLock.release()
-
-def log_performance_statistics(walltime):
-    global PerformanceCounters
-    global CounterLock
-
-    statstr = "***** Statistics *****\n"
-    tot_sent = 0
-    tot_usrtime = 0
-    tot_systime = 0
-    tot_time = 0
-    tot_units = 0
-    total = dict()
-
-    CounterLock.acquire()
-    for proc, data in PerformanceCounters.items():
-        for key, val in data.items():
-            if total.get(key) is not None:
-                total[key] += val
-            else:
-                total[key] = val
-
-    statstr += ("* Total procs: %d\n" % len(PerformanceCounters))
-    CounterLock.release()
-    statstr += ("* Wallclock time: %f\n" % walltime)
-
-    if total.get('totalusrtime') is not None:
-        statstr += ("** Total usertime: %f\n" % total['totalusrtime'])
-    if total.get('totalsystime') is not None:
-        statstr += ("** Total systemtime: %f\n" % total['totalsystime'])
-    if total.get('mem') is not None:
-        statstr += ("** Total memory: %d\n" % total['mem'])
-    log.info(statstr)
 
 def print_simple_statistics(outfd):
     st = aggregate_statistics()
