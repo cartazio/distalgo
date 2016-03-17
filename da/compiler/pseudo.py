@@ -77,9 +77,17 @@ EVENT_TYPES = {
     SentEvent:     'send'
 }
 
+SUCHTHAT = " :| "
+
 # Large float and imaginary literals get turned into infinities in the AST.
 # We unparse those infinities to INFSTR.
 INFSTR = "1e" + repr(sys.float_info.max_10_exp + 1)
+
+def to_pseudo(tree):
+    import io
+    textbuf = io.StringIO(newline='')
+    DastUnparser(tree, textbuf)
+    return textbuf.getvalue()
 
 def interleave(inter, f, seq):
     """Call f on each item in seq, calling inter() in between.
@@ -137,14 +145,15 @@ class DastUnparser:
 
     def dispatch(self, tree):
         "Dispatcher function, dispatching tree type T to method _T."
-        if isinstance(tree, list):
-            for t in tree:
-                self.dispatch(t)
-            return
-        if isinstance(tree, Statement) and tree.label:
-            self.label(tree.label)
-        meth = getattr(self, "_"+tree.__class__.__name__)
-        meth(tree)
+        if tree:
+            if isinstance(tree, list):
+                for t in tree:
+                    self.dispatch(t)
+                return
+            if isinstance(tree, Statement) and tree.label:
+                self.label(tree.label)
+            meth = getattr(self, "_"+tree.__class__.__name__)
+            meth(tree)
 
 
     ############### Unparsing methods ######################
@@ -155,11 +164,14 @@ class DastUnparser:
     ########################################################
 
     def _Program(self, tree):
-        # for stmt in tree.processes:
-        #     self.dispatch(stmt)
-        # if tree.entry_point:
-        #     self.dispatch(tree.entry_point)
+        if tree.configurations:
+            self.fill("Config")
+            self.enter()
+            self.dispatch(tree.configurations)
+            self.leave()
         self.dispatch(tree.body)
+        if tree.entry_point:
+            self.dispatch(tree.entry_point)
 
     # stmt
     def _SimpleStmt(self, tree):
@@ -389,15 +401,18 @@ class DastUnparser:
         self.write("\n")
         self.label('#STATES')
         self.write(" ")
-        for name in t.ordered_local_names:
-            self.write(name)
-            self.write(" ")
+        for name in t.ordered_local_nameobjs:
+            try:
+                if not name.is_a("function"):
+                    self.write(name.name)
+                    self.write(" ")
+            except AttributeError:
+                print("EEEEEEEEE: ", name)
         self.write("\n")
         if t.configurations:
             self.label("#CONFIG")
             self.write("\n")
-            for key, value in t.configurations:
-                self.fill(key + " : " + repr(value))
+            self.dispatch(t.configurations)
         if t.setup:
             self.label("#INIT")
             self.dispatch(t.setup.body)
@@ -406,13 +421,13 @@ class DastUnparser:
             self.label("#ENTRY_POINT")
             self.dispatch(t.entry_point)
             self.write("\n")
+        if t.body:
+            self.label("#METHODS")
+            self.dispatch(t.body)
+            self.write("\n")
         if t.events:
             self.label("#EVENTS")
             self.dispatch(t.event_handlers)
-            self.write("\n")
-        if t.methods:
-            self.label("#METHODS")
-            self.dispatch(t.methods)
         self.leave()
 
     def _Function(self, t):
@@ -523,7 +538,7 @@ class DastUnparser:
             self.write(repr(t.value))
 
     def _SelfExpr(self, t):
-        self.write("self")
+        self.write("self.id")
 
     def _TrueExpr(self, t):
         self.write("True")
@@ -584,35 +599,35 @@ class DastUnparser:
     def _GeneratorExpr(self, t):
         self.write("(")
         self.dispatch(t.elem)
-        self.write(" | ")
+        self.write(SUCHTHAT)
         interleave(lambda: self.write(", "), self.dispatch, t.conditions)
         self.write(")")
 
     def _ListCompExpr(self, t):
         self.write("[")
         self.dispatch(t.elem)
-        self.write(" | ")
+        self.write(SUCHTHAT)
         interleave(lambda: self.write(", "), self.dispatch, t.conditions)
         self.write("]")
 
     def _SetCompExpr(self, t):
         self.write("{")
         self.dispatch(t.elem)
-        self.write(" | ")
+        self.write(SUCHTHAT)
         interleave(lambda: self.write(", "), self.dispatch, t.conditions)
         self.write("}")
 
     def _TupleCompExpr(self, t):
         self.write("()")
         self.dispatch(t.elem)
-        self.write(" | ")
+        self.write(SUCHTHAT)
         interleave(lambda: self.write(", "), self.dispatch, t.conditions)
         self.write(")")
 
     def _DictCompExpr(self, t):
         self.write("{")
         self.dispatch(t.elem)
-        self.write(" | ")
+        self.write(SUCHTHAT)
         interleave(lambda: self.write(", "), self.dispatch, t.conditions)
         self.write("}")
 
@@ -620,6 +635,11 @@ class DastUnparser:
         self.dispatch(t.key)
         self.write(": ")
         self.dispatch(t.value)
+
+    def _ConfigSpec(self, t):
+        self.write(t.key)
+        self.write(" : ")
+        self.write(repr(t.value))
 
     def _MaxExpr(self, t):
         self.write("max(")
@@ -653,7 +673,7 @@ class DastUnparser:
         for dom in t.domains:
             self.write(prefix)
             self.dispatch(dom)
-        self.write(" | ")
+        self.write(SUCHTHAT)
         self.dispatch(t.predicate)
         self.write("}")
 
@@ -725,6 +745,7 @@ class DastUnparser:
            isinstance(t.value.value, int):
             self.write(" ")
         self.write(".")
+        assert t.attr
         self.write(t.attr)
 
     def _SubscriptExpr(self, t):
@@ -875,7 +896,6 @@ class DastUnparser:
             self.dispatch(t.optional_vars)
 
 if __name__ == '__main__':
-    from da.compiler.ui import daast_from_file
-    from da.compiler.utils import to_pseudo
+    from da.compiler.parser import daast_from_file
     ast = daast_from_file("../test/await.da")
     print(to_pseudo(ast))

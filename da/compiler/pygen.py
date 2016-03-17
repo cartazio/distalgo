@@ -330,6 +330,7 @@ class PythonGenerator(NodeVisitor):
         self.module_args = node._compiler_options
         body = []
         body.extend(self.body(node.body))
+        body.extend(self.visit(node.entry_point))
         return Module(self.preambles + body + self.postambles)
 
     def generate_event_def(self, node):
@@ -418,18 +419,19 @@ class PythonGenerator(NodeVisitor):
         cd.name = node.name
         cd.bases = self.bases(node.bases)
         cd.bases.append(pyAttr("da", "DistProcess"))
-        # ########################################
-        # TODO: just pass these through until we figure out a use for them:
-        cd.keywords = node.ast.keywords
-        cd.starargs = node.ast.starargs
-        cd.kwargs = node.ast.kwargs
-        # ########################################
+        cd.decorator_list = [self.visit(d) for d in node.decorators]
+        if node.ast:
+            # ########################################
+            # TODO: just pass these through until we figure out a use for them:
+            cd.keywords = node.ast.keywords
+            cd.starargs = node.ast.starargs
+            cd.kwargs = node.ast.kwargs
+            # ########################################
         cd.body = [self.generate_init(node)]
         if node.setup is not None:
             cd.body.extend(self.visit(node.setup))
         if node.entry_point is not None:
             cd.body.extend(self._entry_point(node.entry_point))
-        cd.decorator_list = [self.visit(d) for d in node.decorators]
         cd.body.extend(self.body(node.methods))
         cd.body.extend(self.generate_handlers(node))
         return [cd]
@@ -449,7 +451,8 @@ class PythonGenerator(NodeVisitor):
                 fd.args = self.visit(node.parent.args)
                 fd.body = ([Assign(targets=[pyAttr("self", name, Store())],
                                    value=pyName(name))
-                            for name in node.parent.ordered_names] + fd.body)
+                            for name in node.parent.args.ordered_names] +
+                           fd.body)
             fd.args.args.insert(0, arg("self", None))
         fd.decorator_list = [self.visit(d) for d in node.decorators]
         fd.returns = None
@@ -513,7 +516,7 @@ class PythonGenerator(NodeVisitor):
             return Num(node.value)
 
     def visit_SelfExpr(self, node):
-        return pyName("self")
+        return pyAttr("self", "id")
 
     def visit_TrueExpr(self, node):
         return pyTrue()
@@ -1122,11 +1125,11 @@ for attr in dir(self):
     def visit_EventHandler(self, node):
         stmts = self.visit_Function(node)
         stmts.append(Assign([pyAttr(node.name, "_labels")],
-                            (pyNone() if node.labels is None else
+                            (pyNone() if not node.labels else
                              pyCall(pyName("frozenset"),
                                     [Set([Str(l) for l in node.labels])]))))
         stmts.append(Assign([pyAttr(node.name, "_notlabels")],
-                            (pyNone() if node.notlabels is None else
+                            (pyNone() if not node.notlabels else
                              pyCall(pyName("frozenset"),
                                     [Set([Str(l) for l in node.notlabels])]))))
         return stmts
@@ -1193,3 +1196,9 @@ class PatternComprehensionGenerator(PythonGenerator):
         return self.visit(node.pattern)
 
     visit_LiteralPatternExpr = visit_PatternExpr
+
+if __name__ == "__main__":
+    from da.compiler.utils import to_source
+    from da.compiler.parser import daast_from_file
+    dt = daast_from_file("../test/await.da")
+    print(to_source(PythonGenerator('t', None).visit(dt)))

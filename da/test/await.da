@@ -1,7 +1,10 @@
-
+import sys
+import multiprocessing as mp
+from io import StringIO
+import random as rand, importlib as il
 
 class P(process):
-    def setup():
+    def setup(a):
         self.d = 1
         self.x = 1
 
@@ -43,5 +46,6 @@ class Q(process):
 def main():
     ps = new(P, [], 1)
     qs = new(Q, [ps], 1)
+    config(k=1)
     start(ps)
     start(qs)

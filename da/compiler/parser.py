@@ -32,6 +32,7 @@ from da.compiler.utils import printe, printw, printd, Namespace
 
 # DistAlgo keywords
 KW_ENTRY_POINT = "main"
+KW_SETUP = "setup"
 KW_PROCESS_DEF = "process"
 KW_PROCESS_ENTRY_POINT = "run"
 KW_CONFIG = "config"
@@ -74,7 +75,7 @@ def is_setup_func(node):
     """Returns True if this node defines a function named 'setup'."""
 
     return (isinstance(node, FunctionDef) and
-            node.name == "setup")
+            node.name == KW_SETUP)
 
 def extract_label(node):
     """Returns the label name specified in 'node', or None if 'node' is not a
@@ -88,6 +89,52 @@ def extract_label(node):
         return node.operand.operand.id
     else:
         return None
+
+##########################
+# Helper functions:
+##########################
+
+def daast_from_file(filename, args=None):
+    """Generates DistAlgo AST from source file.
+
+    'filename' is the filename of source file. Optional argument 'args' is a
+    Namespace object containing the command line parameters for the compiler.
+    Returns the generated DistAlgo AST.
+
+    """
+    try:
+        with open(filename, 'r') as infd:
+            global InputSize
+            src = infd.read()
+            InputSize = len(src)
+            return daast_from_str(src, filename, args)
+    except Exception as e:
+        print(type(e).__name__, ':', str(e), file=sys.stderr)
+        raise e
+    return None
+
+def daast_from_str(src, filename='<str>', args=None):
+    """Generates DistAlgo AST from source string.
+
+    'src' is the DistAlgo source string to parse. Optional argument 'filename'
+    specifies the filename that appears in error messages, defaults to
+    '<str>'. Optional argument 'args' is a Namespace object containing the
+    command line parameters for the compiler. Returns the generated DistAlgo
+    AST.
+
+    """
+    try:
+        dt = Parser(filename, args)
+        rawast = parse(src, filename)
+        dt.visit(rawast)
+        sys.stderr.write("%s compiled with %d errors and %d warnings.\n" %
+                     (filename, dt.errcnt, dt.warncnt))
+        if dt.errcnt == 0:
+            return dt.program
+    except SyntaxError as e:
+        sys.stderr.write("%s:%d:%d: SyntaxError: %s" % (e.filename, e.lineno,
+                                                    e.offset, e.text))
+    return None
 
 ##########
 # Operator mappings:
@@ -452,7 +499,7 @@ class Parser(NodeVisitor):
         if self.current_process is None:
             return False
         elif isinstance(self.current_scope, dast.Function):
-            return self.current_scope.name == "setup"
+            return self.current_scope.name == KW_SETUP
 
     def enter_query(self):
         pass
@@ -692,7 +739,8 @@ class Parser(NodeVisitor):
         """
         for stmt in statements:
             if (isinstance(stmt, FunctionDef) and stmt.name not in
-                    {KW_RECV_EVENT, KW_SENT_EVENT}):
+                    {KW_RECV_EVENT, KW_SENT_EVENT, KW_SETUP,
+                     KW_PROCESS_ENTRY_POINT}):
                 self.debug("Adding function %s to process scope." % stmt.name,
                            stmt)
                 self.current_scope.add_name(stmt.name)
@@ -767,7 +815,7 @@ class Parser(NodeVisitor):
         isproc, bases = self.parse_bases(node)
         if isproc:
             if type(self.current_parent) is not dast.Program:
-                self.error("Process definition must be at top level.", node)
+                self.error("Process definition must be at module level.", node)
 
             initfun = None
             bodyidx = None
@@ -777,9 +825,9 @@ class Parser(NodeVisitor):
                         initfun = s
                         bodyidx = idx
                     else:
-                        self.error("Duplicate setup() definition.", s)
+                        self.error("Duplicate setup() function.", s)
             if initfun is None:
-                self.error("Process missing 'setup()' definition.", node)
+                self.error("Process missing 'setup()' function.", node)
                 return
 
             n = self.current_scope.add_name(node.name)
@@ -788,7 +836,6 @@ class Parser(NodeVisitor):
             n.add_assignment(proc)
             proc.decorators, _, _ = self.parse_decorators(node)
             self.push_state(proc)
-            self.program.processes.append(proc)
             self.program.body.append(proc)
 
             self.signature(initfun.args)
@@ -796,10 +843,12 @@ class Parser(NodeVisitor):
             # setup() has to be parsed first:
             self.proc_body([node.body[bodyidx]] +
                            node.body[:bodyidx] + node.body[(bodyidx+1):])
+
             dbgstr = ["Process ", proc.name, " has names: "]
             for n in proc._names.values():
                 dbgstr.append("%s: %s; " % (n, str(n.get_typectx())))
             self.debug("".join(dbgstr))
+
             self.pop_state()
             if proc.entry_point is None:
                 self.warn("Process %s missing '%s()' method." %
@@ -825,61 +874,58 @@ class Parser(NodeVisitor):
             self.pop_state()
 
     def visit_FunctionDef(self, node):
-        if (self.current_process is None or
+        if (node.name == KW_ENTRY_POINT and
+            isinstance(self.current_parent, dast.Program)) or \
+            (node.name == KW_PROCESS_ENTRY_POINT and
+             isinstance(self.current_parent, dast.Process)):
+            s = dast.Function(self.current_parent, node, name=node.name)
+            self.current_parent.entry_point = s
+            self.push_state(s)
+        elif node.name == KW_SETUP and \
+             isinstance(self.current_parent, dast.Process):
+            s = dast.Function(self.current_parent, node, name=node.name)
+            self.current_parent.setup = s
+            self.push_state(s)
+
+        elif (self.current_process is None or
                 node.name not in {KW_SENT_EVENT, KW_RECV_EVENT}):
             # This is a normal method
             n = self.current_scope.add_name(node.name)
             s = self.create_stmt(dast.Function, node,
                                  params={"name" : node.name})
             n.add_assignment(s)
-            s.process = self.current_process
-            if isinstance(s.parent, dast.Process):
-                if s.name == KW_PROCESS_ENTRY_POINT:
-                    self.current_process.entry_point = s
-                elif s.name == "setup":
-                    self.current_process.setup = s
-                else:
-                    self.current_process.methods.append(s)
-            elif (isinstance(s.parent, dast.Program) and
-                  s.name == KW_ENTRY_POINT):
-                s.parent.entry_point = s
+            assert s.process is self.current_process
             # Ignore the label decorators:
             s.decorators, _, _ = self.parse_decorators(node)
-            self.current_block = s.body
-            if not self.is_in_setup():
-                self.signature(node.args)
-            self.body(node.body)
-            dbgstr = [s.name, " has names: "]
-            for n in s._names.values():
-                dbgstr.append(("%s: %s; " % (n, str(n.get_typectx()))))
-            self.debug("".join(dbgstr))
-            self.pop_state()
+            self.signature(node.args)
 
         else:
             # This is an event handler:
-            h = dast.EventHandler(self.current_parent, node)
+            s = dast.EventHandler(self.current_parent, node)
             # Parse decorators before adding h to node_stack, since decorators
             # should belong to the outer scope:
-            h.decorators, h.labels, h.notlabels = self.parse_decorators(node)
-            self.push_state(h)
+            s.decorators, s.labels, s.notlabels = self.parse_decorators(node)
+            self.push_state(s)
             events, labels, notlabels = self.parse_event_handler(node)
             events = self.current_process.add_events(events)
-            h.events = events
-            h.labels |= labels
-            h.notlabels |= notlabels
-            if len(h.labels) == 0:
-                h.labels = None
-            if len(h.notlabels) == 0:
-                h.notlabels = None
+            s.events = events
+            s.labels |= labels
+            s.notlabels |= notlabels
             for evt in events:
-                evt.handlers.append(h)
+                evt.handlers.append(s)
                 for v in evt.ordered_freevars:
                     if v is not None:
                         self.debug("adding event argument %s" % v)
-                        h.args.add_arg(v.name)
-            self.current_block = h.body
-            self.body(node.body)
-            self.pop_state()
+                        s.args.add_arg(v.name)
+
+        assert s
+        self.current_block = s.body
+        self.body(node.body)
+        self.pop_state()
+        dbgstr = [s.name, " has names: "]
+        for n in s._names.values():
+            dbgstr.append(("%s: %s; " % (n, str(n.get_typectx()))))
+        self.debug("".join(dbgstr))
 
     def check_await(self, node):
         if (isinstance(node, Call) and
@@ -1103,12 +1149,13 @@ class Parser(NodeVisitor):
             elif type(e) is Yield:
                 stmtobj = self.create_stmt(dast.YieldStmt, node)
                 self.current_context = Read(stmtobj)
-                stmtobj.expr = self.visit(e)
+                if e.value:
+                    stmtobj.expr = self.visit(e.value)
             elif type(e) is YieldFrom:
                 # 'yield' should be a statement, handle it here:
                 stmtobj = self.create_stmt(dast.YieldFromStmt, node)
                 self.current_context = Read(stmtobj)
-                stmtobj.expr = self.visit(e)
+                stmtobj.expr = self.visit(e.value)
 
             else:
                 stmtobj = self.create_stmt(dast.SimpleStmt, node)
@@ -1410,32 +1457,44 @@ class Parser(NodeVisitor):
         expr.attr = node.attr
         self.pop_state()
         if isinstance(expr.value, dast.SelfExpr):
-            # Need to update the namedvar object
-            n = self.current_process.find_name(expr.attr)
-            if n is None:
-                if (self.is_in_setup() and
-                        isinstance(self.current_context, Assignment)):
-                    self.debug("Adding name '%s' to process scope"
-                               " from setup()." % expr.attr, node)
-                    n = self.current_process.add_name(expr.attr)
-                    n.add_assignment(self.current_context.node,
-                                     self.current_context.type)
-                    n.set_scope(self.current_process)
+            if node.attr != "id":
+                # In this case we need to return the NamedVar instance,
+                # instead of 'self.'
+                expr = self.create_expr(dast.SimpleExpr, node)
+                n = self.current_process.find_name(node.attr)
+                if n is None:
+                    if (self.is_in_setup() and
+                            isinstance(self.current_context, Assignment)):
+                        self.debug("Adding name '%s' to process scope"
+                                   " from setup()." % node.attr, node)
+                        n = self.current_process.add_name(node.attr)
+                        n.add_assignment(self.current_context.node,
+                                         self.current_context.type)
+                        n.set_scope(self.current_process)
+                    else:
+                        self.error("Undefined process state variable: " +
+                                   str(node.attr), node)
                 else:
-                    self.error("Undefined process state variable: " +
-                               str(expr.attr), node)
+                    if isinstance(self.current_context, Assignment) or \
+                       isinstance(self.current_context, Delete):
+                        self.debug("Assignment to variable '%s'" % str(n), node)
+                        n.add_assignment(self.current_context.node,
+                                         self.current_context.type)
+                    elif isinstance(self.current_context, Update):
+                        self.debug("Update to process variable '%s'" %
+                                   str(n), node)
+                        n.add_update(self.current_context.node,
+                                     self.current_context.type)
+                    else:
+                        n.add_read(expr)
+
+                assert n.scope
+                expr.value = n
+                self.pop_state()
+
             else:
-                if isinstance(self.current_context, Assignment) or \
-                   isinstance(self.current_context, Delete):
-                    self.debug("Assignment to variable '%s'" % str(n), node)
-                    n.add_assignment(self.current_context.node,
-                                     self.current_context.type)
-                elif isinstance(self.current_context, Update):
-                    self.debug("Update to process variable '%s'" % str(n), node)
-                    n.add_update(self.current_context.node,
-                                 self.current_context.type)
-                else:
-                    n.add_read(expr)
+                # "self.id" is represented by SelfExpr
+                expr = expr.value
         return expr
 
     def ensure_one_arg(self, name, node):
@@ -1790,7 +1849,7 @@ class Parser(NodeVisitor):
             else:
                 self.error("Invalid configuration value.", vnode)
             if value is not None:
-                res.append((key, value))
+                res.append(dast.ConfigSpec(self.current_parent, kw, key, value))
         return res
 
     def visit_Call(self, node):
